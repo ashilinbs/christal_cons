@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import io
+from datetime import datetime
 
 
 load_dotenv()
@@ -172,23 +173,36 @@ def generate_bill():
     if not items:
         return jsonify({"error": "No items provided"}), 400
 
-    # Create PDF in memory
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
+    y = height - 40
 
-    y = height - 50
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(200, y, "Customer Bill")
-    y -= 40
+    # 🔷 Store Details
+    pdf.setFont("Helvetica-Bold", 18)
+    pdf.drawCentredString(width / 2, y, "Christal Supermarket")
+    y -= 20
+    pdf.setFont("Helvetica", 11)
+    pdf.drawCentredString(width / 2, y, "Thalachavilai,kulappuram,Kanyakumari")
+    y -= 15
+    pdf.drawCentredString(width / 2, y, "GSTIN: 33BBGPC1776H2ZV | Contact: +91-9744928126")
+    y -= 30
 
-    pdf.setFont("Helvetica", 12)
-    pdf.drawString(50, y, "Product Name")
-    pdf.drawString(250, y, "Quantity")
-    pdf.drawString(350, y, "Price")
-    pdf.drawString(450, y, "Total")
+    # 🔸 Bill Details
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(50, y, f"Date: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+    pdf.drawString(400, y, f"Bill No: {int(datetime.now().timestamp())}")
     y -= 20
 
+    # 🔹 Table Header
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawString(50, y, "Product Name")
+    pdf.drawString(240, y, "Qty")
+    pdf.drawString(300, y, "Price")
+    pdf.drawString(380, y, "Total")
+    y -= 15
+
+    pdf.setFont("Helvetica", 11)
     grand_total = 0
     for item in items:
         name = item['product_name']
@@ -197,22 +211,49 @@ def generate_bill():
         total = quantity * price
         grand_total += total
 
+        if y < 100:  # New page if near bottom
+            pdf.showPage()
+            y = height - 50
+            pdf.setFont("Helvetica", 11)
+
         pdf.drawString(50, y, name)
-        pdf.drawString(250, y, str(quantity))
-        pdf.drawString(350, y, f"₹{price}")
-        pdf.drawString(450, y, f"₹{total:.2f}")
+        pdf.drawString(240, y, str(quantity))
+        pdf.drawString(300, y, f"₹{price}")
+        pdf.drawString(380, y, f"₹{total:.2f}")
         y -= 20
+
+    # 🔸 GST Calculations
+    gst_rate = 0.18
+    gst_amount = grand_total * gst_rate
+    cgst = sgst = gst_amount / 2
+    total_with_gst = grand_total + gst_amount
 
     y -= 10
     pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawString(350, y, "Grand Total:")
-    pdf.drawString(450, y, f"₹{grand_total:.2f}")
+    pdf.drawString(300, y, "Subtotal:")
+    pdf.drawString(400, y, f"₹{grand_total:.2f}")
+    y -= 20
+    pdf.setFont("Helvetica", 11)
+    pdf.drawString(300, y, "CGST (9%):")
+    pdf.drawString(400, y, f"₹{cgst:.2f}")
+    y -= 20
+    pdf.drawString(300, y, "SGST (9%):")
+    pdf.drawString(400, y, f"₹{sgst:.2f}")
+    y -= 20
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawString(300, y, "Grand Total:")
+    pdf.drawString(400, y, f"₹{total_with_gst:.2f}")
+
+    # 🔻 Footer
+    y -= 40
+    pdf.setFont("Helvetica-Oblique", 10)
+    pdf.drawCentredString(width / 2, y, "Thank you for shopping with Christal Supermarket!")
+    pdf.drawCentredString(width / 2, y - 15, "Please visit again.")
 
     pdf.save()
     buffer.seek(0)
 
     return send_file(buffer, as_attachment=True, download_name="bill.pdf", mimetype="application/pdf")
-
 
 @app.route("/products/<product_id>", methods=["DELETE"])
 def delete_product(product_id):
@@ -446,43 +487,46 @@ def place_order():
         return jsonify({"error": "Missing fields in order"}), 400
 
     try:
-        
         try:
             data["quantity"] = int(data["quantity"])
         except ValueError:
             return jsonify({"error": "Quantity must be an integer"}), 400
 
-        
         product = products_collection.find_one({"_id": ObjectId(data["product_id"])})
 
         if not product:
             return jsonify({"error": "Product not found"}), 404
 
-       
+        # ✅ Check stock before proceeding
+        if data["quantity"] > product.get("stock", 0):
+            return jsonify({"error": f"Only {product.get('stock', 0)} items in stock."}), 400
+
         unit_price = product["price"]
         total_price = unit_price * data["quantity"]
 
-        
         data["price"] = unit_price
         data["total_price"] = total_price
 
-      
         if 'image_url' in product:
             data["image"] = product["image_url"]
 
-        
-        result = orders_collection.insert_one(data)
-
-       
-        products_collection.update_one(
-            {"_id": ObjectId(data["product_id"])},
+        # ✅ Atomically decrease stock only if available
+        update_result = products_collection.update_one(
+            {"_id": ObjectId(data["product_id"]), "stock": {"$gte": data["quantity"]}},
             {"$inc": {"stock": -data["quantity"]}}
         )
+
+        if update_result.modified_count == 0:
+            return jsonify({"error": "Not enough stock available."}), 400
+
+        # Now insert the order
+        result = orders_collection.insert_one(data)
 
         return jsonify({"message": "Order placed successfully", "order_id": str(result.inserted_id)}), 201
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 @app.route("/order-history", methods=["GET"])
 def order_history():
     password = request.args.get('password')  # You can also get it from the headers if preferred
